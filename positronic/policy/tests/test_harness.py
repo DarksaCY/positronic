@@ -999,8 +999,7 @@ def test_a_world_stopping_mid_episode_withdraws_the_deadline(world):
 
 @pytest.mark.timeout(3.0)
 def test_an_episode_abandoned_by_a_raise_withdraws_the_deadline(world):
-    """A raise mid-episode reaches neither ``_end_episode`` nor ``_finalize_recording``, so the last thing
-    the harness ever says would otherwise be a deadline nothing will meet."""
+    """An episode a raise abandons withdraws its deadline like any other close."""
 
     class _BoomSession(Session):
         def __call__(self, obs):
