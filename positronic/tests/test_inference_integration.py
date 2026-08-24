@@ -20,8 +20,8 @@ from positronic.dataset.serializers import Serializers
 from positronic.drivers.roboarm import command as roboarm_command
 from positronic.drivers.roboarm.models import bundled_panda_model
 from positronic.eval import ROBOT_STATIC_META, Command, Embodiment, Eval, Observation, Task
+from positronic.policy.layers import ChunkedSchedule
 from positronic.policy.tests.test_harness import RemoteStubPolicy, StubPolicy
-from positronic.policy.wrappers import ChunkedSchedule
 from positronic.simulator.env_server import telemetry as env_telemetry
 from positronic.simulator.mujoco.sim import MujocoSim
 from positronic.simulator.mujoco.transforms import AddBox, SetBodyPosition
@@ -112,6 +112,8 @@ def test_sim_emits_commands_and_records_dataset(tmp_path, monkeypatch):  # noqa:
     # own post-reset scene (seeds 100 and 101), bit-reproducible from a fresh reset on the same seed. A
     # dropped frame-0 — or a stale step from the prior trial's run loop bleeding in — would record a
     # post-step state instead.
+    # TODO: the reference is a bare reset because no config asks for a starting arm pose. A task that sets
+    # ``keys.ARM`` in ``prepare_args`` moves the arm before frame-0, and the reference needs the same move.
     for i, seed in enumerate((100, 101)):
         reference = MujocoSim(
             'positronic/assets/mujoco/franka_table.xml', positronic.cfg.simulator.stack_cubes_loaders()
