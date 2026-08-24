@@ -393,14 +393,17 @@ class Harness(pimm.ControlSystem):
         stream races the next trial's ask for the same device.
         """
         args = self._task.prepare_args
-        ready = pimm.calls.all_of([
-            ask(args.get(name)) for name, ask in self.prepare.items() if self._releases_at_close(name)
-        ])
+        asked = {name: ask(args.get(name)) for name, ask in self.prepare.items() if self._releases_at_close(name)}
+        ready = pimm.calls.all_of(asked.values())
         while not ready.done() and not should_stop.value:
             yield pimm.Sleep(POLL_PERIOD_SEC)
-        # Nothing to raise to at teardown: the World is coming down and each driver parks what it owns.
+        # rules-allow: swallowed-error — the World is coming down and each driver parks what it owns, so
+        # there is no caller left to raise to; the log is the only place a release cut short can go.
         if ready.done():
             ready.result()
+        else:
+            outstanding = sorted(name for name, answer in asked.items() if not answer.done())
+            logging.error(f'The world stopped before every device was released: {outstanding} did not answer')
 
     def _end_episode(
         self, clock: pimm.Clock, should_stop: pimm.SignalReceiver, payload: dict[str, Any]
