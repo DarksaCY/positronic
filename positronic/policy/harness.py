@@ -335,8 +335,8 @@ class Harness(pimm.ControlSystem):
     ) -> Generator[pimm.Command, None, None]:
         """Commit the live episode: cancel the in-flight chunk, stop the recorder — stamping the
         episode's full static meta (plus any terminal payload) — then close its span."""
-        # Every close comes through here, the world stopping under a live episode included, and this is
-        # before the round below, in which every other system would read it.
+        # Every close comes through here, so this is where the withdrawal goes; before the yield below, so
+        # it lands in the closing episode's own round.
         self._set_deadline(None)
         # Stamped before the worker is retired: the meta overlays what its session reports.
         stop = DsWriterCommand.STOP({**self._build_episode_meta(), **(payload or {})})
