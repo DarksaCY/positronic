@@ -32,16 +32,6 @@ POLL_PERIOD_SEC = 0.01
 SKIP_REPLY_SEC = 0.001
 
 
-def _releases_at_close(name: str) -> bool:
-    """Whether the thing ``name`` readies is one an ending episode lets go of.
-
-    Everything but the scene and the operator: those two SET UP the next trial, and asking them as one
-    ends would redraw the world the operator is about to score and send her to stage a tote she has not
-    scored yet. Written as an exclusion so a device kind nobody has added yet is released by default.
-    """
-    return name.split('.', 1)[0] not in (keys.SCENE, keys.HUMAN)
-
-
 class _InferenceWorker:
     """One episode's policy session, called one at a time on a thread of its own so the harness keeps
     playing while the model runs.
@@ -384,6 +374,16 @@ class Harness(pimm.ControlSystem):
         self._deadline = clock.now() + budget if budget is not None else None
         self.ds_command.emit(DsWriterCommand.START())
 
+    @staticmethod
+    def _releases_at_close(name: str) -> bool:
+        """Whether the thing ``name`` readies is one an ending episode lets go of.
+
+        Everything but the scene and the operator: those two SET UP the next trial, and asking them as one
+        ends would redraw the world the operator is about to score and send her to stage a tote she has not
+        scored yet. Written as an exclusion so a device kind nobody has added yet is released by default.
+        """
+        return name.split('.', 1)[0] not in (keys.SCENE, keys.HUMAN)
+
     def _release(self, should_stop: pimm.SignalReceiver) -> Generator[pimm.Command, None, None]:
         """Put a real rig's devices back where a trial starts them, and wait for them to get there.
 
@@ -394,7 +394,7 @@ class Harness(pimm.ControlSystem):
         """
         args = self._task.prepare_args
         ready = pimm.calls.all_of([
-            ask(args.get(name)) for name, ask in self.prepare.items() if _releases_at_close(name)
+            ask(args.get(name)) for name, ask in self.prepare.items() if self._releases_at_close(name)
         ])
         while not ready.done() and not should_stop.value:
             yield pimm.Sleep(POLL_PERIOD_SEC)
