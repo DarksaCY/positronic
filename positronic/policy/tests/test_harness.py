@@ -895,9 +895,10 @@ def test_done_after_deadline_is_a_timeout(world):
 
 
 @pytest.mark.timeout(3.0)
-def test_the_deadline_is_published_when_the_episode_opens(world):
+def test_the_deadline_is_published_once_the_rig_is_ready(world):
     """An idle harness publishes nothing: ``deadline`` states the instant the harness will stop at, and
-    between episodes there is none to state."""
+    between episodes there is none to state. The first one goes out when the episode's prepare has
+    answered — this embodiment readies nothing, so that is the round the task is taken."""
     harness = Harness(StubPolicy(), make_embodiment())
     p = _pair_all(world, harness)
 
@@ -916,27 +917,65 @@ def test_the_deadline_is_published_when_the_episode_opens(world):
 
 
 @pytest.mark.timeout(3.0)
+def test_no_deadline_is_published_while_the_rig_is_still_readying(world):
+    """A rig that takes its time readying gets no deadline until it answers, so the reset never comes out
+    of the budget — and a display shows no countdown rather than one measured from before the episode."""
+
+    class _SlowScene(pimm.ControlSystem):
+        """A prepare handler that answers only once ``release`` is set."""
+
+        def __init__(self):
+            self.env_reset = pimm.calls.ControlSystemHandler[Any, None](self)
+            self.release = False
+
+        def run(self, should_stop, clock):
+            held = []
+            while not should_stop.value:
+                held.extend(self.env_reset.incoming())
+                if self.release:
+                    for call in held:
+                        call.set_result(None)
+                    held = []
+                yield pimm.Sleep(0.001)
+
+    scene = _SlowScene()
+    harness = Harness(StubPolicy(), make_embodiment(prepare_handlers={keys.SCENE: scene.env_reset}))
+    p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.SCENE], scene.env_reset)
+
+    scheduler = world.start([harness, scene])
+    p['perform_task'](Task(instruction_source='t', timeout_sec=5.0))
+    drive_scheduler(scheduler, steps=100)
+    assert _deadlines(p) == [], 'a deadline went out while the rig was still readying'
+
+    scene.release = True
+    drive_scheduler(scheduler, steps=100)
+    assert _deadlines(p) and _deadlines(p)[0] is not None, 'the readied rig never got its deadline'
+
+
+@pytest.mark.timeout(3.0)
 def test_the_deadline_is_rearmed_at_the_first_observation(world):
-    """The deadline moves to the episode's first observation, so a reset costs the episode nothing."""
-    reset_sec, timeout_sec = 0.5, 5.0
+    """The deadline moves to the episode's first observation, so the turns spent delivering that frame
+    cost the episode nothing. The reset already costs it nothing: the first one is armed after prepare."""
+    ready_to_obs_sec, timeout_sec = 0.5, 5.0
     harness = Harness(StubPolicy(), make_embodiment())
     p = _pair_all(world, harness)
     robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
 
     driver = ManualDriver([
-        (None, reset_sec),  # the episode is open with nothing observing it yet
+        (None, ready_to_obs_sec),  # the rig is ready and the episode is running, with nothing observing yet
         (partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state), 100.0),
     ])
     scheduler = world.start([harness, driver])
     p['perform_task'](Task(instruction_source='t', timeout_sec=timeout_sec))
     drive_scheduler(scheduler, steps=200)
 
-    # Exactly two: armed at the open, moved once when the first observation landed. A re-arm on every
-    # observation would leave more, and would keep the deadline receding for as long as the policy ran.
-    at_open, at_first_obs = _deadlines(p)
-    assert at_open is not None and at_first_obs is not None, 'the episode published no deadline to run against'
-    assert at_open == pytest.approx(timeout_sec, abs=POLL_PERIOD_SEC)
-    assert at_first_obs - at_open == pytest.approx(reset_sec, abs=POLL_PERIOD_SEC)
+    # Exactly two: armed once the rig was ready, moved once when the first observation landed. A re-arm on
+    # every observation would leave more, and would keep the deadline receding for as long as the policy ran.
+    at_ready, at_first_obs = _deadlines(p)
+    assert at_ready is not None and at_first_obs is not None, 'the episode published no deadline to run against'
+    assert at_ready == pytest.approx(timeout_sec, abs=POLL_PERIOD_SEC)
+    assert at_first_obs - at_ready == pytest.approx(ready_to_obs_sec, abs=POLL_PERIOD_SEC)
 
 
 @pytest.mark.timeout(3.0)
