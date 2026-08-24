@@ -316,7 +316,7 @@ def test_harness_emits_cartesian_move(world):
     cmd_recorder = RecordingEmitter()
     grip_recorder = RecordingEmitter()
     harness.commands[keys.ROBOT_COMMAND]._bind(cmd_recorder)
-    harness.commands['target_grip']._bind(grip_recorder)
+    harness.commands[keys.TARGET_GRIP]._bind(grip_recorder)
     harness.ds_command._bind(RecordingEmitter())
 
     frame_em = world.pair(harness.observations[CAM])
@@ -476,7 +476,7 @@ def test_harness_waits_for_complete_inputs(world):
     cmd_recorder = RecordingEmitter()
     grip_recorder = RecordingEmitter()
     harness.commands[keys.ROBOT_COMMAND]._bind(cmd_recorder)
-    harness.commands['target_grip']._bind(grip_recorder)
+    harness.commands[keys.TARGET_GRIP]._bind(grip_recorder)
     harness.ds_command._bind(RecordingEmitter())
 
     frame_em = world.pair(harness.observations[CAM])
@@ -606,6 +606,55 @@ def test_finish_emits_ds_stop_with_data(world):
     assert len(stops) == 1
     assert stops[0].static_data['outcome'] == 'Success'
     assert stops[0].static_data['notes'] == 'good'
+
+
+def _devices(asked: list[str]) -> tuple[_Scene, _Scene]:
+    """An arm and a hand that answer a readying ask, each recording that it was asked."""
+    return _Scene(lambda _r: asked.append(keys.ARM)), _Scene(lambda _r: asked.append(keys.GRIPPER))
+
+
+@pytest.mark.timeout(3.0)
+def test_a_closing_episode_releases_a_real_rig(world):
+    """A powered rig holds the policy's last setpoint until something else says otherwise: an arm left in
+    the tote stays there, and a hand stays shut on what it gripped. The close asks for the same readying
+    the open does, so the rig is clear while the operator scores rather than at the next Start."""
+    asked: list[str] = []
+    arm, hand = _devices(asked)
+    handlers = {keys.ARM: arm.env_reset, keys.GRIPPER: hand.env_reset}
+    harness = Harness(StubPolicy(), make_embodiment(prepare_handlers=handlers))
+    p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.ARM], arm.env_reset)
+    wire_call(world, harness.prepare[keys.GRIPPER], hand.env_reset)
+
+    scheduler = world.start([harness, arm, hand])
+    p['perform_task'](Task(instruction_source='test', timeout_sec=None))
+    drive_scheduler(scheduler, steps=40)
+    assert sorted(asked) == [keys.ARM, keys.GRIPPER], 'the open readies both devices'
+
+    p['done_em'].emit({keys.EVAL_SUCCESS: True})
+    drive_scheduler(scheduler, steps=40)
+    assert sorted(asked[2:]) == [keys.ARM, keys.GRIPPER], 'and so does the close'
+
+
+@pytest.mark.timeout(3.0)
+def test_a_closing_episode_leaves_a_simulated_rig_where_it_stands(world):
+    """The boundary the case above rests on. A sim's readying is what DRAWS its next scene, so asking for
+    it at the close would wipe the end state the operator is about to score."""
+    asked: list[str] = []
+    arm, hand = _devices(asked)
+    handlers = {keys.ARM: arm.env_reset, keys.GRIPPER: hand.env_reset}
+    harness = Harness(StubPolicy(), make_embodiment(prepare_handlers=handlers, simulated=True))
+    p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.ARM], arm.env_reset)
+    wire_call(world, harness.prepare[keys.GRIPPER], hand.env_reset)
+
+    scheduler = world.start([harness, arm, hand])
+    p['perform_task'](Task(instruction_source='test', timeout_sec=None))
+    drive_scheduler(scheduler, steps=40)
+    p['done_em'].emit({keys.EVAL_SUCCESS: True})
+    drive_scheduler(scheduler, steps=40)
+
+    assert sorted(asked) == [keys.ARM, keys.GRIPPER], 'the open readied them once, and the close not again'
 
 
 @pytest.mark.timeout(3.0)
@@ -953,7 +1002,7 @@ def test_timeout_during_inference_drops_the_chunk(world):
     grip_recorder = RecordingEmitter()
     ds_recorder = RecordingEmitter()
     harness.commands[keys.ROBOT_COMMAND]._bind(cmd_recorder)
-    harness.commands['target_grip']._bind(grip_recorder)
+    harness.commands[keys.TARGET_GRIP]._bind(grip_recorder)
     harness.ds_command._bind(ds_recorder)
 
     frame_em = world.pair(harness.observations[CAM])
@@ -1222,7 +1271,7 @@ def test_empty_trajectory_leaves_every_channel_holding(world):
     cmd_recorder = RecordingEmitter()
     grip_recorder = RecordingEmitter()
     harness.commands[keys.ROBOT_COMMAND]._bind(cmd_recorder)
-    harness.commands['target_grip']._bind(grip_recorder)
+    harness.commands[keys.TARGET_GRIP]._bind(grip_recorder)
     harness.ds_command._bind(RecordingEmitter())
 
     frame_em = world.pair(harness.observations[CAM])
