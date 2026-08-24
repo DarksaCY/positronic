@@ -397,13 +397,18 @@ class Harness(pimm.ControlSystem):
         ready = pimm.calls.all_of(asked.values())
         while not ready.done() and not should_stop.value:
             yield pimm.Sleep(POLL_PERIOD_SEC)
-        # rules-allow: swallowed-error — the World is coming down and each driver parks what it owns, so
-        # there is no caller left to raise to; the log is the only place a release cut short can go.
-        if ready.done():
-            ready.result()
-        else:
+        # rules-allow: swallowed-error — a close clears the rig while the operator scores; it is a courtesy,
+        # not a correctness gate. The gate is the next episode's `prepare`, which raises on a rig still stuck
+        # and does so before anything is recorded, so a release that fails costs the run nothing. Raising
+        # here would let one reflex on the way home end a run with episodes left to play.
+        if not ready.done():
             outstanding = sorted(name for name, answer in asked.items() if not answer.done())
             logging.error(f'The world stopped before every device was released: {outstanding} did not answer')
+            return
+        try:
+            ready.result()
+        except Exception as exc:
+            logging.error(f'Releasing the rig after the episode ended failed: {exc}')
 
     def _end_episode(
         self, clock: pimm.Clock, should_stop: pimm.SignalReceiver, payload: dict[str, Any]

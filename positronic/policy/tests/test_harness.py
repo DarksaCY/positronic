@@ -1,3 +1,5 @@
+import itertools
+import logging
 import threading
 import time
 from contextlib import contextmanager
@@ -655,6 +657,53 @@ def test_a_closing_episode_leaves_a_simulated_rig_where_it_stands(world):
     drive_scheduler(scheduler, steps=40)
 
     assert sorted(asked) == [keys.ARM, keys.GRIPPER], 'the open readied them once, and the close not again'
+
+
+def _fails_from(nth: int):
+    """A readying that answers normally until the ``nth`` ask, then fails the way an aborted move does."""
+    asks = itertools.count(1)
+
+    def ready(_request):
+        if next(asks) >= nth:
+            raise RuntimeError('motion aborted by reflex!')
+
+    return ready
+
+
+@pytest.mark.timeout(3.0)
+def test_a_release_that_fails_is_logged_and_leaves_the_run_playing(world, caplog):
+    """A reflex on the way home aborts the move and fails the release. The episode is still answered and the
+    run plays on: a close clears the rig for the operator, and the next open is what gates a stuck rig."""
+    arm = _Scene(_fails_from(2))  # the open readies it, the close is the ask that trips
+    harness = Harness(StubPolicy(), make_embodiment(prepare_handlers={keys.ARM: arm.env_reset}))
+    p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.ARM], arm.env_reset)
+
+    scheduler = world.start([harness, arm])
+    answer = p['perform_task'](Task(instruction_source='test', timeout_sec=None))
+    drive_scheduler(scheduler, steps=40)
+    with caplog.at_level(logging.ERROR):
+        p['done_em'].emit({keys.EVAL_SUCCESS: True})
+        drive_scheduler(scheduler, steps=40)
+
+    assert answer.done() and answer.result()[keys.EVAL_SUCCESS] is True, 'the episode was answered'
+    assert 'motion aborted by reflex!' in caplog.text, 'and the failure reached the log'
+
+
+@pytest.mark.timeout(3.0)
+def test_a_readying_that_fails_at_the_open_still_ends_the_run(world):
+    """The boundary the case above rests on. Tolerating a failed release must not tolerate a failed OPEN:
+    that one gates a rig too stuck to run, and it raises before the episode records anything."""
+    arm = _Scene(_fails_from(1))
+    harness = Harness(StubPolicy(), make_embodiment(prepare_handlers={keys.ARM: arm.env_reset}))
+    p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.ARM], arm.env_reset)
+
+    scheduler = world.start([harness, arm])
+    p['perform_task'](Task(instruction_source='test', timeout_sec=None))
+
+    with pytest.raises(RuntimeError, match='motion aborted by reflex!'):
+        drive_scheduler(scheduler, steps=40)
 
 
 @pytest.mark.timeout(3.0)
