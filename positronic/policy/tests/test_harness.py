@@ -263,8 +263,8 @@ def _pair_all(world, harness):
     """Pair all harness signals and return a dict of test handles."""
     ds_recorder = RecordingEmitter()
     harness.ds_command._bind(ds_recorder)
-    budget_recorder = RecordingEmitter()
-    harness.budget._bind(budget_recorder)
+    deadline_recorder = RecordingEmitter()
+    harness.deadline._bind(deadline_recorder)
     return {
         'frame_em': world.pair(harness.observations[CAM]),
         'robot_em': world.pair(harness.observations[keys.ROBOT_STATE]),
@@ -275,7 +275,7 @@ def _pair_all(world, harness):
         'grip_rx': world.pair(harness.commands['target_grip']),
         'meta_em': world.pair(harness.robot_meta_in),
         'ds_recorder': ds_recorder,
-        'budget_recorder': budget_recorder,
+        'deadline_recorder': deadline_recorder,
     }
 
 
@@ -283,9 +283,9 @@ def _ds_commands(p) -> list[DsWriterCommand]:
     return [data for _, data in p['ds_recorder'].emitted]
 
 
-def _budgets(p) -> list[float | None]:
+def _deadlines(p) -> list[float | None]:
     """Every deadline the harness published, in the order it published them."""
-    return [data for _, data in p['budget_recorder'].emitted]
+    return [data for _, data in p['deadline_recorder'].emitted]
 
 
 def _ds_types(p) -> list[DsWriterCommandType]:
@@ -896,7 +896,7 @@ def test_done_after_deadline_is_a_timeout(world):
 
 @pytest.mark.timeout(3.0)
 def test_the_deadline_is_published_when_the_episode_opens(world):
-    """An idle harness publishes nothing: ``budget`` states the deadline the harness will stop at, and
+    """An idle harness publishes nothing: ``deadline`` states the instant the harness will stop at, and
     between episodes there is none to state."""
     harness = Harness(StubPolicy(), make_embodiment())
     p = _pair_all(world, harness)
@@ -904,14 +904,14 @@ def test_the_deadline_is_published_when_the_episode_opens(world):
     driver = ManualDriver([(None, 100.0)])  # outlives the pumping, so the world stays up between phases
     scheduler = world.start([harness, driver])
     drive_scheduler(scheduler, steps=20)
-    assert _budgets(p) == []
+    assert _deadlines(p) == []
 
     asked_at = world.clock.now()
     p['perform_task'](Task(instruction_source='t', timeout_sec=5.0))
     drive_scheduler(scheduler, steps=20)
     # The world is already past zero here, so the published instant and a bare ``timeout_sec`` are
     # different numbers, which is what this pins.
-    assert _budgets(p) == [pytest.approx(asked_at + 5.0, abs=2 * POLL_PERIOD_SEC)]
+    assert _deadlines(p) == [pytest.approx(asked_at + 5.0, abs=2 * POLL_PERIOD_SEC)]
     assert asked_at > 2 * POLL_PERIOD_SEC, 'the two would be indistinguishable at a clock still near zero'
 
 
@@ -934,7 +934,7 @@ def test_the_deadline_is_rearmed_at_the_first_observation(world):
 
     # Exactly two: armed at the open, moved once when the first observation landed. A re-arm on every
     # observation would leave more, and would keep the deadline receding for as long as the policy ran.
-    at_open, at_first_obs = _budgets(p)
+    at_open, at_first_obs = _deadlines(p)
     assert at_open is not None and at_first_obs is not None, 'the episode published no deadline to run against'
     assert at_open == pytest.approx(timeout_sec, abs=POLL_PERIOD_SEC)
     assert at_first_obs - at_open == pytest.approx(reset_sec, abs=POLL_PERIOD_SEC)
@@ -957,8 +957,8 @@ def test_the_deadline_clears_when_the_episode_ends(world):
     drive_scheduler(scheduler, steps=200)
 
     assert [c.type for c in _ds_commands(p)].count(DsWriterCommandType.STOP_EPISODE) == 1, 'the episode never ended'
-    assert _budgets(p)[-1] is None
-    assert _budgets(p).count(None) == 1, 'a deadline was withdrawn while the episode was still running'
+    assert _deadlines(p)[-1] is None
+    assert _deadlines(p).count(None) == 1, 'a deadline was withdrawn while the episode was still running'
 
 
 @pytest.mark.timeout(3.0)
@@ -976,7 +976,7 @@ def test_an_episode_with_no_timeout_publishes_no_deadline(world):
     p['perform_task'](Task(instruction_source='t', timeout_sec=None))
     drive_scheduler(scheduler, steps=200)
 
-    assert _budgets(p) == [None]
+    assert _deadlines(p) == [None]
 
 
 @pytest.mark.timeout(3.0)

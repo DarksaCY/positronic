@@ -244,7 +244,7 @@ class Harness(pimm.ControlSystem):
         self.ds_command = pimm.ControlSystemEmitter[DsWriterCommand](self)
         # The instant on the world's clock the live episode ends at, ``None`` while no deadline stands.
         # A duration would be stale the round after it was read.
-        self.budget = pimm.ControlSystemEmitter[float | None](self)
+        self.deadline = pimm.ControlSystemEmitter[float | None](self)
         self.robot_meta_in = pimm.DefaultingReceiver(self, default={})
         # Stop-signal: a truthy payload within the trial's budget ends it.
         self.done = pimm.DefaultingReceiver[dict](self, default={})
@@ -351,7 +351,7 @@ class Harness(pimm.ControlSystem):
         """Arm the live episode's deadline and publish it: the enforced one and the published one never
         disagree."""
         self._deadline = deadline
-        self.budget.emit(deadline)
+        self.deadline.emit(deadline)
 
     def _begin_episode(
         self, clock: pimm.Clock, should_stop: pimm.SignalReceiver, call: pimm.calls.Call[Task, dict[str, Any]]
