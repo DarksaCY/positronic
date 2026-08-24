@@ -1,5 +1,6 @@
 import itertools
 import logging
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -659,13 +660,18 @@ def test_a_closing_episode_leaves_a_simulated_rig_where_it_stands(world):
     assert sorted(asked) == [keys.ARM, keys.GRIPPER], 'the open readied them once, and the close not again'
 
 
+# What a reflex trip reads like when it aborts a move: raised by the readying below, asserted by both
+# tests that drive it.
+ABORTED_BY_REFLEX = 'motion aborted by reflex!'
+
+
 def _fails_from(nth: int):
     """A readying that answers normally until the ``nth`` ask, then fails the way an aborted move does."""
     asks = itertools.count(1)
 
     def ready(_request):
         if next(asks) >= nth:
-            raise RuntimeError('motion aborted by reflex!')
+            raise RuntimeError(ABORTED_BY_REFLEX)
 
     return ready
 
@@ -687,7 +693,7 @@ def test_a_release_that_fails_is_logged_and_leaves_the_run_playing(world, caplog
         drive_scheduler(scheduler, steps=40)
 
     assert answer.done() and answer.result()[keys.EVAL_SUCCESS] is True, 'the episode was answered'
-    assert 'motion aborted by reflex!' in caplog.text, 'and the failure reached the log'
+    assert ABORTED_BY_REFLEX in caplog.text, 'and the failure reached the log'
 
 
 @pytest.mark.timeout(3.0)
@@ -702,7 +708,7 @@ def test_a_readying_that_fails_at_the_open_still_ends_the_run(world):
     scheduler = world.start([harness, arm])
     p['perform_task'](Task(instruction_source='test', timeout_sec=None))
 
-    with pytest.raises(RuntimeError, match='motion aborted by reflex!'):
+    with pytest.raises(RuntimeError, match=re.escape(ABORTED_BY_REFLEX)):
         drive_scheduler(scheduler, steps=40)
 
 
