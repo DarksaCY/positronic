@@ -917,8 +917,7 @@ def test_the_deadline_is_published_when_the_episode_opens(world):
 
 @pytest.mark.timeout(3.0)
 def test_the_deadline_is_rearmed_at_the_first_observation(world):
-    """The budget runs from the episode's first observation. The turns spent readying the rig are not
-    the episode's time, so a deadline armed when the task was asked for is short by the reset."""
+    """The deadline moves to the episode's first observation, so a reset costs the episode nothing."""
     reset_sec, timeout_sec = 0.5, 5.0
     harness = Harness(StubPolicy(), make_embodiment())
     p = _pair_all(world, harness)
