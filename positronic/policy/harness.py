@@ -351,8 +351,8 @@ class Harness(pimm.ControlSystem):
         self._telemetry.end(virtual_now)
 
     def _set_deadline(self, deadline: float | None) -> None:
-        """Arm the live episode's deadline and publish it: the enforced one and the published one never
-        disagree."""
+        """Arm the live episode's deadline and publish it, so the enforced one and the published one never
+        disagree. The port carries ``None`` whenever none stands, so every path out of an episode clears it."""
         self._deadline = deadline
         self.deadline.emit(deadline)
 
