@@ -640,8 +640,8 @@ def test_a_closing_episode_releases_a_real_rig(world):
 
 @pytest.mark.timeout(3.0)
 def test_a_closing_episode_leaves_a_simulated_rig_where_it_stands(world):
-    """The boundary the case above rests on. A sim's readying is what DRAWS its next scene, so asking for
-    it at the close would wipe the end state the operator is about to score."""
+    """A sim's readying is what DRAWS its next scene, so asking for it at the close would wipe the end
+    state the operator is about to score."""
     asked: list[str] = []
     arm, hand = _devices(asked)
     handlers = {keys.ARM: arm.env_reset, keys.GRIPPER: hand.env_reset}
@@ -692,8 +692,8 @@ def test_a_release_that_fails_is_logged_and_leaves_the_run_playing(world, caplog
 
 @pytest.mark.timeout(3.0)
 def test_a_readying_that_fails_at_the_open_still_ends_the_run(world):
-    """The boundary the case above rests on. Tolerating a failed release must not tolerate a failed OPEN:
-    that one gates a rig too stuck to run, and it raises before the episode records anything."""
+    """Tolerating a failed release must not tolerate a failed OPEN: that one gates a rig too stuck to run,
+    and it raises before the episode has recorded anything."""
     arm = _Scene(_fails_from(1))
     harness = Harness(StubPolicy(), make_embodiment(prepare_handlers={keys.ARM: arm.env_reset}))
     p = _pair_all(world, harness)
