@@ -23,7 +23,7 @@ from positronic.geom import Rotation, Transform3D
 from positronic.offboard.client import InferenceSession
 from positronic.policy.base import DelegatingSession, Layer, Policy, Session
 from positronic.policy.codec import ActionTimestamp
-from positronic.policy.harness import Harness, _InferenceWorker
+from positronic.policy.harness import POLL_PERIOD_SEC, Harness, _InferenceWorker
 from positronic.policy.layers import ChunkedSchedule, StopOnFault
 from positronic.policy.remote import RemoteSession
 from positronic.tests.testing_coutils import ManualDriver, RecordingEmitter, drive_scheduler
@@ -263,6 +263,8 @@ def _pair_all(world, harness):
     """Pair all harness signals and return a dict of test handles."""
     ds_recorder = RecordingEmitter()
     harness.ds_command._bind(ds_recorder)
+    budget_recorder = RecordingEmitter()
+    harness.budget._bind(budget_recorder)
     return {
         'frame_em': world.pair(harness.observations[CAM]),
         'robot_em': world.pair(harness.observations[keys.ROBOT_STATE]),
@@ -273,11 +275,17 @@ def _pair_all(world, harness):
         'grip_rx': world.pair(harness.commands['target_grip']),
         'meta_em': world.pair(harness.robot_meta_in),
         'ds_recorder': ds_recorder,
+        'budget_recorder': budget_recorder,
     }
 
 
 def _ds_commands(p) -> list[DsWriterCommand]:
     return [data for _, data in p['ds_recorder'].emitted]
+
+
+def _budgets(p) -> list[float | None]:
+    """Every deadline the harness published, in the order it published them."""
+    return [data for _, data in p['budget_recorder'].emitted]
 
 
 def _ds_types(p) -> list[DsWriterCommandType]:
@@ -884,6 +892,91 @@ def test_done_after_deadline_is_a_timeout(world):
     assert len(stops) == 1
     assert stops[0].static_data[keys.EVAL_TERMINATED] is False
     assert keys.EVAL_SUCCESS not in stops[0].static_data
+
+
+@pytest.mark.timeout(3.0)
+def test_the_deadline_is_published_when_the_episode_opens(world):
+    """An idle harness publishes nothing: ``budget`` states the deadline the harness will stop at, and
+    between episodes there is none to state."""
+    harness = Harness(StubPolicy(), make_embodiment())
+    p = _pair_all(world, harness)
+
+    driver = ManualDriver([(None, 100.0)])  # outlives the pumping, so the world stays up between phases
+    scheduler = world.start([harness, driver])
+    drive_scheduler(scheduler, steps=20)
+    assert _budgets(p) == []
+
+    asked_at = world.clock.now()
+    p['perform_task'](Task(instruction_source='t', timeout_sec=5.0))
+    drive_scheduler(scheduler, steps=20)
+    # An instant on the world's clock, not the time left: the world is already past zero here, so a
+    # ``timeout_sec`` published as-is would read 5.0 rather than the instant the harness stops at.
+    assert _budgets(p) == [pytest.approx(asked_at + 5.0, abs=2 * POLL_PERIOD_SEC)]
+    assert asked_at > 2 * POLL_PERIOD_SEC, 'the two would be indistinguishable at a clock still near zero'
+
+
+@pytest.mark.timeout(3.0)
+def test_the_deadline_is_rearmed_at_the_first_observation(world):
+    """The budget runs from the episode's first observation, not from the ask: the turns spent readying
+    the rig are not the episode's time, so a countdown armed at the ask runs short by the reset."""
+    reset_sec, timeout_sec = 0.5, 5.0
+    harness = Harness(StubPolicy(), make_embodiment())
+    p = _pair_all(world, harness)
+    robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
+
+    driver = ManualDriver([
+        (None, reset_sec),  # the episode is open with nothing observing it yet
+        (partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state), 100.0),
+    ])
+    scheduler = world.start([harness, driver])
+    p['perform_task'](Task(instruction_source='t', timeout_sec=timeout_sec))
+    drive_scheduler(scheduler, steps=200)
+
+    # Exactly two: armed at the open, moved once when the first observation landed. A re-arm on every
+    # observation would leave more, and would keep the deadline receding for as long as the policy ran.
+    at_open, at_first_obs = _budgets(p)
+    assert at_open is not None and at_first_obs is not None, 'the episode published no deadline to run against'
+    assert at_open == pytest.approx(timeout_sec, abs=POLL_PERIOD_SEC)
+    assert at_first_obs - at_open == pytest.approx(reset_sec, abs=POLL_PERIOD_SEC)
+
+
+@pytest.mark.timeout(3.0)
+def test_the_deadline_clears_when_the_episode_ends(world):
+    """``None`` at the close is what tells a display the countdown is over, and it is published only
+    there: cleared mid-episode it would stop a countdown the harness is still enforcing."""
+    harness = Harness(StubPolicy(), make_embodiment())
+    p = _pair_all(world, harness)
+    robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
+
+    driver = ManualDriver([
+        (partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state), 0.2),
+        (partial(p['done_em'].emit, {keys.EVAL_SUCCESS: True}), 100.0),
+    ])
+    scheduler = world.start([harness, driver])
+    p['perform_task'](Task(instruction_source='t', timeout_sec=5.0))
+    drive_scheduler(scheduler, steps=200)
+
+    assert [c.type for c in _ds_commands(p)].count(DsWriterCommandType.STOP_EPISODE) == 1, 'the episode never ended'
+    assert _budgets(p)[-1] is None
+    assert _budgets(p).count(None) == 1, 'a deadline was withdrawn while the episode was still running'
+
+
+@pytest.mark.timeout(3.0)
+def test_an_episode_with_no_timeout_publishes_no_deadline(world):
+    """A task with no ``timeout_sec`` states that nothing bounds it rather than leaving the port silent:
+    a display still holding the previous episode's deadline would otherwise count down against it."""
+    harness = Harness(StubPolicy(), make_embodiment())
+    p = _pair_all(world, harness)
+    robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
+
+    driver = ManualDriver([
+        (partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state), 100.0)
+    ])
+    scheduler = world.start([harness, driver])
+    p['perform_task'](Task(instruction_source='t', timeout_sec=None))
+    drive_scheduler(scheduler, steps=200)
+
+    assert _budgets(p) == [None]
 
 
 @pytest.mark.timeout(3.0)

@@ -242,6 +242,10 @@ class Harness(pimm.ControlSystem):
         self.perform_task = pimm.calls.ControlSystemHandler[Task, dict[str, Any]](self)
         self.manual_command = pimm.ControlSystemReceiver(self)
         self.ds_command = pimm.ControlSystemEmitter[DsWriterCommand](self)
+        # The instant on the world's clock the live episode ends at, ``None`` while no deadline stands.
+        # An instant rather than the time left, which decays between rounds: a reader holding the last
+        # value it got is still right.
+        self.budget = pimm.ControlSystemEmitter[float | None](self)
         self.robot_meta_in = pimm.DefaultingReceiver(self, default={})
         # Stop-signal: a truthy payload within the trial's budget ends it.
         self.done = pimm.DefaultingReceiver[dict](self, default={})
@@ -344,6 +348,12 @@ class Harness(pimm.ControlSystem):
         # producer stepping in that shared round charges ≤ one control period to the closing episode.
         self._telemetry.end(virtual_now)
 
+    def _set_deadline(self, deadline: float | None) -> None:
+        """Arm the live episode's deadline and publish it: the enforced one and the published one never
+        disagree."""
+        self._deadline = deadline
+        self.budget.emit(deadline)
+
     def _begin_episode(
         self, clock: pimm.Clock, should_stop: pimm.SignalReceiver, call: pimm.calls.Call[Task, dict[str, Any]]
     ) -> Generator[pimm.Command, None, None]:
@@ -372,7 +382,7 @@ class Harness(pimm.ControlSystem):
             self.policy, {keys.TASK: self._task.instruction}, self._charges_wall_time, clock
         )
         budget = self._task.timeout_sec
-        self._deadline = clock.now() + budget if budget is not None else None
+        self._set_deadline(clock.now() + budget if budget is not None else None)
         self.ds_command.emit(DsWriterCommand.START())
 
     def _end_episode(self, clock: pimm.Clock, payload: dict[str, Any]) -> Generator[pimm.Command, None, None]:
@@ -382,6 +392,8 @@ class Harness(pimm.ControlSystem):
         The worker is retired rather than joined here, so a ``RemoteSession``'s websocket outlives the call
         still using it.
         """
+        # Before the round ``_finalize_recording`` yields, in which every other system would read it.
+        self._set_deadline(None)
         yield from self._finalize_recording(clock, payload)
         if not self._embodiment.simulated:  # a powered arm holds the policy's last setpoint until the next trial
             self._emit({name: Reset() for name in self.commands if keys.is_robot_command(name)})
@@ -439,7 +451,7 @@ class Harness(pimm.ControlSystem):
             self._rollout_started = True
             self._telemetry.start_rollout(clock.now())
             if self._task.timeout_sec is not None:
-                self._deadline = clock.now() + self._task.timeout_sec
+                self._set_deadline(clock.now() + self._task.timeout_sec)
         return inputs
 
     def _step(self, worker: _InferenceWorker, clock: pimm.Clock) -> None:
