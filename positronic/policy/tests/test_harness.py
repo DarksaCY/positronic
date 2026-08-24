@@ -909,16 +909,16 @@ def test_the_deadline_is_published_when_the_episode_opens(world):
     asked_at = world.clock.now()
     p['perform_task'](Task(instruction_source='t', timeout_sec=5.0))
     drive_scheduler(scheduler, steps=20)
-    # An instant on the world's clock, not the time left: the world is already past zero here, so a
-    # ``timeout_sec`` published as-is would read 5.0 rather than the instant the harness stops at.
+    # The world is already past zero here, so the published instant and a bare ``timeout_sec`` are
+    # different numbers, which is what this pins.
     assert _budgets(p) == [pytest.approx(asked_at + 5.0, abs=2 * POLL_PERIOD_SEC)]
     assert asked_at > 2 * POLL_PERIOD_SEC, 'the two would be indistinguishable at a clock still near zero'
 
 
 @pytest.mark.timeout(3.0)
 def test_the_deadline_is_rearmed_at_the_first_observation(world):
-    """The budget runs from the episode's first observation, not from the ask: the turns spent readying
-    the rig are not the episode's time, so a countdown armed at the ask runs short by the reset."""
+    """The budget runs from the episode's first observation. The turns spent readying the rig are not
+    the episode's time, so a deadline armed when the task was asked for is short by the reset."""
     reset_sec, timeout_sec = 0.5, 5.0
     harness = Harness(StubPolicy(), make_embodiment())
     p = _pair_all(world, harness)
@@ -963,8 +963,8 @@ def test_the_deadline_clears_when_the_episode_ends(world):
 
 @pytest.mark.timeout(3.0)
 def test_an_episode_with_no_timeout_publishes_no_deadline(world):
-    """A task with no ``timeout_sec`` states that nothing bounds it rather than leaving the port silent:
-    a display still holding the previous episode's deadline would otherwise count down against it."""
+    """A task with no ``timeout_sec`` publishes ``None``, which corrects a reader still holding the
+    previous episode's deadline. Silence would leave it counting down against one that has lapsed."""
     harness = Harness(StubPolicy(), make_embodiment())
     p = _pair_all(world, harness)
     robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])

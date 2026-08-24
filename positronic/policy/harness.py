@@ -243,8 +243,7 @@ class Harness(pimm.ControlSystem):
         self.manual_command = pimm.ControlSystemReceiver(self)
         self.ds_command = pimm.ControlSystemEmitter[DsWriterCommand](self)
         # The instant on the world's clock the live episode ends at, ``None`` while no deadline stands.
-        # An instant rather than the time left, which decays between rounds: a reader holding the last
-        # value it got is still right.
+        # A duration would be stale the round after it was read.
         self.budget = pimm.ControlSystemEmitter[float | None](self)
         self.robot_meta_in = pimm.DefaultingReceiver(self, default={})
         # Stop-signal: a truthy payload within the trial's budget ends it.
