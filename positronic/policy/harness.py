@@ -335,6 +335,9 @@ class Harness(pimm.ControlSystem):
     ) -> Generator[pimm.Command, None, None]:
         """Commit the live episode: cancel the in-flight chunk, stop the recorder — stamping the
         episode's full static meta (plus any terminal payload) — then close its span."""
+        # Every close comes through here, the world stopping under a live episode included, and this is
+        # before the round below, in which every other system would read it.
+        self._set_deadline(None)
         # Stamped before the worker is retired: the meta overlays what its session reports.
         stop = DsWriterCommand.STOP({**self._build_episode_meta(), **(payload or {})})
         self._cancel_session()
@@ -391,8 +394,6 @@ class Harness(pimm.ControlSystem):
         The worker is retired rather than joined here, so a ``RemoteSession``'s websocket outlives the call
         still using it.
         """
-        # Before the round ``_finalize_recording`` yields, in which every other system would read it.
-        self._set_deadline(None)
         yield from self._finalize_recording(clock, payload)
         if not self._embodiment.simulated:  # a powered arm holds the policy's last setpoint until the next trial
             self._emit({name: Reset() for name in self.commands if keys.is_robot_command(name)})
@@ -539,6 +540,9 @@ class Harness(pimm.ControlSystem):
             # A no-op once the block above has answered: the world coming down under a live episode is the
             # one way a call goes unanswered, and it is the caller's to hear about.
             self._fail_call(RuntimeError('The world stopped before the episode ended'))
+            # An episode abandoned by a raise never reaches ``_finalize_recording``, and would leave a
+            # deadline standing that nothing will ever meet.
+            self._set_deadline(None)
             self._retire_worker()
             self._reap_worker()
 

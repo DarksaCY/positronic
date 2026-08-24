@@ -979,6 +979,54 @@ def test_an_episode_with_no_timeout_publishes_no_deadline(world):
 
 
 @pytest.mark.timeout(3.0)
+def test_a_world_stopping_mid_episode_withdraws_the_deadline(world):
+    """A run that ends with an episode still live withdraws its deadline like any other close: a receiver
+    latches what it last got, and there is no later episode to correct it."""
+    harness = Harness(StubPolicy(), make_embodiment())
+    p = _pair_all(world, harness)
+    robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
+
+    # The script runs out while the episode is live; a control system returning is what stops the world.
+    driver = ManualDriver([(partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state), 0.1)])
+    scheduler = world.start([harness, driver])
+    # A budget far longer than the run, so expiry cannot be what withdraws the deadline.
+    p['perform_task'](Task(instruction_source='t', timeout_sec=100.0))
+    drive_scheduler(scheduler, steps=200)
+
+    assert _deadlines(p)[0] is not None, 'no deadline was ever armed, so nothing here was under test'
+    assert _deadlines(p)[-1] is None
+
+
+@pytest.mark.timeout(3.0)
+def test_an_episode_abandoned_by_a_raise_withdraws_the_deadline(world):
+    """A raise mid-episode reaches neither ``_end_episode`` nor ``_finalize_recording``, so the last thing
+    the harness ever says would otherwise be a deadline nothing will meet."""
+
+    class _BoomSession(Session):
+        def __call__(self, obs):
+            raise RuntimeError('inference boom')
+
+    class _BoomPolicy(Policy):
+        def new_session(self, context=None, now=None):
+            return _BoomSession()
+
+    harness = Harness(_BoomPolicy(), make_embodiment())
+    p = _pair_all(world, harness)
+    robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
+
+    driver = ManualDriver([
+        (partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state), 100.0)
+    ])
+    scheduler = world.start([harness, driver])
+    p['perform_task'](Task(instruction_source='t', timeout_sec=100.0))
+    with pytest.raises(RuntimeError, match='inference boom'):
+        drive_scheduler(scheduler, steps=200)
+
+    assert _deadlines(p)[0] is not None, 'no deadline was ever armed, so nothing here was under test'
+    assert _deadlines(p)[-1] is None
+
+
+@pytest.mark.timeout(3.0)
 def test_a_trial_asking_to_ready_what_the_rig_has_not_got_fails_loudly(world):
     """The args are read per handler, so a name matching none of them would be dropped and the device would
     silently get its own default instead of what the trial asked for."""
