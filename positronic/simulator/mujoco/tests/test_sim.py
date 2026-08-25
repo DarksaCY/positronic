@@ -48,8 +48,8 @@ def test_a_sync_move_travels_the_arm_to_the_joints_it_asks_for():
         np.testing.assert_allclose(state.value.q, target, atol=sim._MOVE_TOL)
 
 
-def test_a_sync_move_that_asks_for_nothing_puts_the_arm_home():
-    """Readying a rig is this call with nothing in it, so where it goes is the sim's own home pose."""
+def test_a_sync_move_takes_the_arm_over_from_the_command_stream():
+    """Between moves the stream owns the arm, so a move has to retarget what the stream last set."""
     sim = MujocoSim(MODEL, loaders=())
 
     with pimm.World(virtual_time=True) as world:
@@ -61,9 +61,9 @@ def test_a_sync_move_that_asks_for_nothing_puts_the_arm_home():
 
         commands.emit(roboarm_command.JointPosition(home + 0.3))
         drive_scheduler(scheduler, steps=_turns(sim, 2.0))
-        assert np.max(np.abs(state.value.q - home)) > sim._MOVE_TOL, 'the arm never left home'
+        assert np.max(np.abs(state.value.q - home)) > sim._MOVE_TOL, 'the streamed command never moved the arm'
 
-        _answered(scheduler, move(None), _turns(sim, 5.0)).result()
+        _answered(scheduler, move(roboarm_command.JointPosition(home)), _turns(sim, 5.0)).result()
         np.testing.assert_allclose(state.value.q, home, atol=sim._MOVE_TOL)
 
 
@@ -240,24 +240,23 @@ def test_a_move_to_a_pose_the_arm_cannot_reach_hands_its_asker_the_reason():
             _answered(scheduler, answer, _turns(sim, 1.0)).result()
 
 
-def test_frame_zero_waits_for_the_arm_a_trial_readies():
-    """Frame-0 follows both prepare answers, so it is the first thing an episode opening on them can see."""
+def test_a_redraw_publishes_the_scene_before_it_answers():
+    """A trial opening on the redraw's answer finds the scene it drew already on the channels."""
     sim = MujocoSim(MODEL, loaders=())
 
     with pimm.World(virtual_time=True) as world:
         draw = world.pair(sim.env_reset)
-        move = world.pair(sim.sync_move)
         state = world.pair(sim.state)
         meta = world.pair(sim.robot_meta)
         scheduler = world.start([sim])
-        home = _at_rest(scheduler, state, sim)
-        meta.read()  # the run start emits it too; frame-0 is the next one
+        _at_rest(scheduler, state, sim)
+        meta.read()  # the run start emits it too; the redraw's is the next one
 
-        drawn, readied = draw({}), move(roboarm_command.JointPosition(home + 0.3))
+        drawn = draw({})
 
         for _ in range(_turns(sim, 5.0)):
             next(scheduler)
-            if pimm.value_updated(meta) is not None:
-                assert drawn.done() and readied.done(), 'frame-0 went out while the trial was still being readied'
+            if drawn.done():
+                assert pimm.value_updated(meta) is not None, 'the redraw answered before it published the scene'
                 return
-        pytest.fail('frame-0 never went out')
+        pytest.fail('the redraw never answered')

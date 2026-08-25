@@ -331,10 +331,10 @@ class _CountdownAdapter(EnvAdapter):
 
 
 @pytest.mark.timeout(60.0)
-def test_proxy_publishes_frame0_then_free_runs():
-    """``reset`` arms frame-0 (step 0); the proxy publishes it on its next turn and clears ``done``, then
-    free-runs — it steps the env every active tick (physics progresses through the inference window). The
-    step-count obs makes it observable: frame-0 is step 0, then it advances each tick with no command needed."""
+def test_proxy_publishes_the_reset_frame_then_free_runs():
+    """``reset`` publishes the env's frame (step 0) and clears ``done``, then the proxy free-runs — it steps
+    the env every active tick (physics progresses through the inference window). The step-count obs makes it
+    observable: the reset publishes step 0, then it advances each tick with no command needed."""
     with serve_env(_CountdownEnv()) as (host, port), pimm.World(virtual_time=True) as world:
         proxy = RemoteEnvControlSystem(_CountdownAdapter(), nullcontext((host, port)))
         obs_rx = world.pair(proxy.observations['value'])
@@ -343,8 +343,7 @@ def test_proxy_publishes_frame0_then_free_runs():
         scheduler = world.start([proxy])
         drive_scheduler(scheduler, steps=2)  # inactive: the proxy paces time without an env
 
-        proxy.reset({keys.EVAL_SEED: 0})  # arm frame-0; the run loop publishes it on its next turn
-        drive_scheduler(scheduler, steps=1)
+        proxy.reset({keys.EVAL_SEED: 0})
         np.testing.assert_array_equal(obs_rx.read().data, np.zeros(7))
         assert done_rx.read().data == {}
 
@@ -429,7 +428,7 @@ class _JointposChunks(Policy):
         self.chunk_len = chunk_len
         self.chunks = 0
 
-    def new_session(self, context=None, now=None):
+    def new_session(self, context=None, now=None, rt=None):
         return _JointposChunkSession(self)
 
 
@@ -466,13 +465,13 @@ def test_full_chunk_executes_between_replans(env_server, tmp_path):
 
     grip = LocalDataset(tmp_path)[0].signals['target_grip']
     executed = [(float(v), int(ts)) for v, ts in (grip[i] for i in range(len(grip)))]
-    values = [v for v, _ in executed if v >= 100.0]  # the inter-episode home command emits 0.0
+    values = [v for v, _ in executed]  # every sample is a chunk action: nothing else commands this channel
     complete_chunks = raw.chunks - 1  # the deadline cuts the last chunk short
     assert complete_chunks >= 2
     expected = [c * 100.0 + i for c in range(1, complete_chunks + 1) for i in range(chunk_len)]
     assert values[: len(expected)] == expected
 
-    starts = [ts for v, ts in executed if v >= 100.0 and v % 100 == 0]
+    starts = [ts for v, ts in executed if v % 100 == 0]
     period_ns = chunk_len * control_dt * 1e9
     for earlier, later in zip(starts, starts[1:], strict=False):
         assert later - earlier == pytest.approx(period_ns, abs=period_ns / (2 * chunk_len))

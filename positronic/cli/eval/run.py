@@ -19,6 +19,7 @@ from positronic.cli.eval.submit import submit
 from positronic.dataset.ds_writer_agent import TimeMode
 from positronic.dataset.local_dataset import LocalDatasetWriter
 from positronic.eval import Embodiment, Eval, Task
+from positronic.policy.executor import Executor
 from positronic.policy.harness import Harness
 from positronic.simulator.env_server.telemetry import ATTR_RUN_ID, ENV_RUN_ID, ENV_TELEMETRY_DIR
 
@@ -92,9 +93,10 @@ def _run_world(policy, ev: Eval, output_dir: Path | None):
         if embodiment.simulated:
             # Why this order:
             # - Each scheduler pass is one instant: everything emitted in it shares a timestamp.
-            # - The harness tells the recorder when an episode opens; only later-stamped samples get in.
-            # - The recorder runs in the harness's pass, so the episode opens at the reset.
-            # - The producers run after it, so the observation the reset produced is the episode's first.
+            # - The harness tells the recorder when an episode opens, so the recorder runs after it and opens
+            #   in that same pass.
+            # - The producers run last, so what the recorder finds on the channels is the frame the reset
+            #   published, with no step in between.
             world.run([driver, harness, ds_agent, *producers])
         else:
             world.run([driver, harness], [*producers, ds_agent])
@@ -190,7 +192,10 @@ def main(policy, *, evals: list[Eval], output_dir: str | Path | None = None, tim
     # TODO: a policy with recording taps (recording_dir set) records this throwaway warmup session — an
     # empty .rrd plus a bump to the recorder's episode counter — but warmup is not a real episode.
     logger.info('Warming up policy endpoints')
-    policy.new_session().close()
+    # The session runs no inference, but a session that serves its model on a runtime needs one to open.
+    warmup_runtime = Executor(policy.functions)
+    policy.new_session(rt=warmup_runtime).close()
+    warmup_runtime.close()
     output_dir = prepare_output_dir(output_dir)
 
     try:

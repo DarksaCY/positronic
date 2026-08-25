@@ -72,7 +72,7 @@ class ObservationCodec(Codec):
     def _derive_task(self, episode: Episode) -> Any:
         return self._normalize_task(episode[keys.TASK] if keys.TASK in episode else '')
 
-    def _decode_single(self, data: dict, context: dict | None) -> dict:
+    def _decode_single(self, data: dict) -> dict:
         return {}
 
     def encode(self, inputs: dict[str, Any]) -> dict[str, Any]:

@@ -15,7 +15,7 @@ from positronic.dataset.ds_writer_agent import DsWriterCommand, DsWriterCommandT
 from positronic.dataset.serializers import Serializers
 from positronic.drivers import roboarm
 from positronic.drivers.roboarm import RobotStatus
-from positronic.drivers.roboarm.command import CartesianDelta, CartesianPosition, Reset, from_wire, to_wire
+from positronic.drivers.roboarm.command import CartesianDelta, CartesianPosition, JointPosition, from_wire, to_wire
 from positronic.drivers.roboarm.models import DEFAULT_FRAME, EE_LINK, bundled_franka_model
 from positronic.drivers.roboarm.tests.fakes import make_robot_state
 from positronic.eval import Command, Embodiment, Observation, Task
@@ -25,7 +25,7 @@ from positronic.policy.base import DelegatingSession, Layer, Policy, Session
 from positronic.policy.codec import ActionTimestamp
 from positronic.policy.harness import Harness, _InferenceWorker
 from positronic.policy.layers import ChunkedSchedule, StopOnFault
-from positronic.policy.remote import RemoteSession
+from positronic.policy.remote import INFER, RemoteSession, round_trip
 from positronic.tests.testing_coutils import ManualDriver, RecordingEmitter, drive_scheduler
 
 
@@ -97,7 +97,7 @@ class SpyPolicy(Policy):
         self.reset_calls: int = 0
         self.last_reset_context = None
 
-    def new_session(self, context=None, now=None):
+    def new_session(self, context=None, now=None, rt=None):
         self.reset_calls += 1
         self.last_reset_context = context
         return _SpySession(self)
@@ -142,7 +142,7 @@ class StubPolicy(Policy):
     def meta(self) -> dict[str, object]:
         return self._meta
 
-    def new_session(self, context=None, now=None) -> Session:
+    def new_session(self, context=None, now=None, rt=None) -> Session:
         self.reset_calls += 1
         self.last_reset_context = context
         return _StubSession(self)
@@ -172,7 +172,7 @@ class ChunkPolicy(StubPolicy):
         super().__init__(*args, **kwargs)
         self.counter = 0
 
-    def new_session(self, context=None, now=None):
+    def new_session(self, context=None, now=None, rt=None):
         self.reset_calls += 1
         self.last_reset_context = context
         return _ChunkSession(self)
@@ -213,9 +213,14 @@ class RemoteStubPolicy(Policy):
         self.target_grip = float(target_grip)
         self.wall_sec = wall_sec
 
-    def new_session(self, context=None, now=None) -> RemoteSession:
+    def new_session(self, context=None, now=None, rt=None) -> RemoteSession:
+        assert rt is not None, 'the harness supplies the runtime'
         action = [{'robot_command': self.command, 'target_grip': self.target_grip, 'timestamp': 0.0}]
-        return RemoteSession(_FakeInferenceSession(action, self.wall_sec))
+        return RemoteSession(_FakeInferenceSession(action, self.wall_sec), rt)
+
+    @property
+    def functions(self):
+        return {INFER: round_trip}
 
 
 @pytest.fixture
@@ -244,17 +249,20 @@ class _Pacer(pimm.ControlSystem):
 
 
 class _Scene(pimm.ControlSystem):
-    """The scene a trial runs in, drawn by ``draw`` when the harness asks."""
+    """The scene a trial runs in, drawn by ``draw`` when the harness asks and answered ``draw_s`` later."""
 
-    def __init__(self, draw):
+    def __init__(self, draw, draw_s: float = 0.0):
         self.env_reset = pimm.calls.ControlSystemHandler[Any, None](self)
         self._draw = draw
+        self._draw_s = draw_s
 
     def run(self, should_stop, clock):
         while not should_stop.value:
             for call in self.env_reset.incoming():
                 with pimm.calls.raise_to(call):
                     self._draw(call.request)
+                    if self._draw_s:
+                        yield pimm.Sleep(self._draw_s)
                     call.set_result(None)
             yield pimm.Sleep(0.001)
 
@@ -489,9 +497,8 @@ def test_harness_waits_for_complete_inputs(world):
     robot_state = make_robot_state([0.2, 0.0, -0.1], [0.7, 0.1, -0.2])
 
     def assert_no_inference():
-        # The startup home may have emitted (Reset / grip 0.0); the policy must not have run on partial inputs.
         assert policy.last_obs is None
-        assert all(isinstance(c, Reset) for c in _emitted_commands(cmd_recorder))
+        assert not _emitted_commands(cmd_recorder)
 
     driver = ManualDriver([
         (partial(perform_task, Task(instruction_source='dummy-task', timeout_sec=None)), 0.01),
@@ -561,7 +568,7 @@ def test_episode_meta_includes_policy_static_meta(world):
             pose = Transform3D(translation=np.array([0.4, 0.5, 0.6], dtype=np.float32), rotation=Rotation.identity)
             self._command = CartesianPosition(pose=pose)
 
-        def new_session(self, context=None, now=None):
+        def new_session(self, context=None, now=None, rt=None):
             return _StaticMetaSession(self._command)  # Session.meta defaults to {}
 
         @property
@@ -641,8 +648,7 @@ def test_the_world_stopping_under_a_live_episode_fails_the_call(world):
 
 @pytest.mark.timeout(3.0)
 def test_trial_ends_at_its_timeout(world):
-    """Nothing ever lands on ``done``, yet the trial still ends at ``task.timeout_sec``: terminated=False,
-    robot homed."""
+    """Nothing ever lands on ``done``, yet the trial still ends at ``task.timeout_sec``: terminated=False."""
     policy = StubPolicy()
     harness = Harness(policy, make_embodiment())
     p = _pair_all(world, harness)
@@ -658,46 +664,26 @@ def test_trial_ends_at_its_timeout(world):
 
 
 @pytest.mark.timeout(3.0)
-def test_trial_budget_starts_at_the_first_usable_observation(world):
-    """The 0.05 budget is measured from the episode's first usable observation, not from the reset.
-
-    The driver holds every channel silent for 0.02, so the episode opens with nothing to infer on. The
-    delivery at 0.02 is rejected by the camera serializer — the state a real embodiment is in while the
-    arm resets — so the first usable observation is the one at 0.04, and a third at 0.06 carries grip 0.75
-    as a marker. Measured from the reset the budget ends at 0.05 and the policy never sees the marker;
-    measured from the first usable observation it ends at 0.09 and the policy does.
-
-    The rejected delivery matters on its own: it clears the channels out of ``_awaiting_obs`` without
-    yielding an observation, so a budget anchored on that set alone would never move off the reset.
-    """
-    policy = SpyPolicy()
-    embodiment = make_embodiment()
-    usable = iter([None])  # the first camera sample is not ready; every later one is
-    embodiment.observations[CAM] = Observation(
-        pimm.ControlSystemEmitter(Passive()), lambda frames: next(usable, Serializers.camera_images(frames))
-    )
-    harness = Harness(policy, embodiment)
+def test_trial_budget_starts_when_the_rig_is_ready(world):
+    """The 0.05 budget is measured from the end of the prepare, not from the ask: the 0.2 the scene takes to
+    draw is not the trial's to spend."""
+    scene = _Scene(lambda _: None, draw_s=0.2)
+    harness = Harness(StubPolicy(), make_embodiment(prepare_handlers={keys.SCENE: scene.env_reset}))
     p = _pair_all(world, harness)
-    robot_state = make_robot_state([0.2, 0.0, -0.1], [0.7, 0.1, -0.2])
-    payload = partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state)
+    wire_call(world, harness.prepare[keys.SCENE], scene.env_reset)
 
-    def marked():
-        payload()
-        p['grip_em'].emit(0.75)
+    scheduler = world.start([harness, scene, _Pacer()])
+    opened = world.clock.now()
+    answer = p['perform_task'](Task(instruction_source='test', timeout_sec=0.05, prepare_args={keys.SCENE: {}}))
+    drive_scheduler(scheduler, steps=2000)
 
-    driver = ManualDriver([(None, 0.02), (payload, 0.02), (payload, 0.02), (marked, 0.2)])
-
-    scheduler = world.start([harness, driver])
-    p['perform_task'](Task(instruction_source='test', timeout_sec=0.05))
-    drive_scheduler(scheduler, steps=400)
-
-    assert policy.last_obs is not None, 'the trial expired before its first observation landed'
-    assert policy.last_obs[keys.GRIP] == 0.75, 'the budget expired early — measured from reset, not the first obs'
+    assert answer.done(), 'the trial never ended'
+    assert world.clock.now() - opened >= 0.25, 'the budget was spent on the draw'
 
 
 @pytest.mark.timeout(3.0)
 def test_trial_stop_signal_terminates(world):
-    """Delivering the privileged ``done`` ends a trial early: terminated=True, payload recorded, homed."""
+    """Delivering the privileged ``done`` ends a trial early: terminated=True, payload recorded."""
     policy = StubPolicy()
     harness = Harness(policy, make_embodiment())
     p = _pair_all(world, harness)
@@ -756,9 +742,9 @@ def test_stale_done_does_not_terminate_next_trial(world):
 
 
 class _FrameIndexDevice(pimm.ControlSystem):
-    """Publishes a rising frame index on ``state``. ``reset`` arms frame-0; the run loop publishes it (with
-    fresh ``meta``) on its next turn — in sequence, before any step — then steps and publishes the next each
-    tick. A reader whose first frame is >= 1 saw the device step before it read."""
+    """Publishes a rising frame index on ``state``. ``reset`` publishes frame 0 (with fresh ``meta``) as it
+    answers, then each turn steps and publishes the next. A reader whose first frame is >= 1 saw the device
+    step before it read."""
 
     def __init__(self):
         self.state = pimm.ControlSystemEmitter(self)
@@ -766,29 +752,24 @@ class _FrameIndexDevice(pimm.ControlSystem):
         self.cmd = pimm.ControlSystemReceiver(self)
         self.env_reset = pimm.calls.ControlSystemHandler[Any, None](self)
         self._frame = 0
-        self._reset_pending = False
 
     def run(self, should_stop, clock):
         while not should_stop.value:
             yield pimm.Sleep(0.01)
             if (call := next(self.env_reset.incoming(), None)) is not None:
-                self._frame, self._reset_pending = 0, True
-                call.set_result(None)  # before frame-0, so the episode is open when it lands
-            elif self._reset_pending:
-                self._reset_pending = False
+                self._frame = 0
                 self.meta.emit({})  # fresh scene meta, recorded into the episode at finalize
-                self.state.emit(float(self._frame))  # frame-0
+                self.state.emit(float(self._frame))
+                call.set_result(None)
             else:
                 self._frame += 1
                 self.state.emit(float(self._frame))
 
 
 @pytest.mark.timeout(3.0)
-def test_policy_first_obs_is_frame0(world):
-    """The first inference reads the post-reset frame-0, never a stepped frame. The harness arms the device's
-    reset and steps last; running after the harness, the device publishes frame-0 that round and the harness
-    reads it the next round — so the policy's first observation is frame 0, before the device steps. Guards
-    the [harness, device] ordering and the in-sequence reset."""
+def test_the_policy_opens_on_the_frame_the_reset_published(world):
+    """The first inference reads the frame the reset published, never a stepped one: the episode opens and
+    infers in the same round, so the device gets no turn to step in between."""
     device = _FrameIndexDevice()
     embodiment = Embodiment(
         descriptor='',
@@ -806,11 +787,11 @@ def test_policy_first_obs_is_frame0(world):
     wire.wire_embodiment(world, harness, embodiment, None)
 
     scheduler = world.start([harness, device])
-    perform_task(Task(instruction_source='t', timeout_sec=100.0))
+    perform_task(Task(instruction_source='t', timeout_sec=100.0, prepare_args={keys.SCENE: {}}))
     drive_scheduler(scheduler, steps=20)
 
     assert policy.observations, 'policy was never called'
-    assert policy.observations[0]['frame'] == 0.0  # frame-0, not a stepped frame
+    assert policy.observations[0]['frame'] == 0.0  # the reset's frame, not a stepped one
     assert any(o['frame'] >= 1.0 for o in policy.observations)  # the device did step (so the guard can fail)
 
 
@@ -887,16 +868,95 @@ def test_done_after_deadline_is_a_timeout(world):
 
 
 @pytest.mark.timeout(3.0)
+def test_a_handler_the_trial_does_not_name_is_left_alone(world):
+    """A rig readies more than any one trial wants, so what a trial leaves unnamed it leaves as it stands."""
+    drawn, moved = [], []
+    scene, arm = _Scene(drawn.append), _Scene(moved.append)
+    handlers = {keys.SCENE: scene.env_reset, keys.ARM: arm.env_reset}
+    harness = Harness(StubPolicy(), make_embodiment(prepare_handlers=handlers))
+    p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.SCENE], scene.env_reset)
+    wire_call(world, harness.prepare[keys.ARM], arm.env_reset)
+
+    scheduler = world.start([harness, scene, arm])
+    p['perform_task'](Task(instruction_source='stack', timeout_sec=0.05, prepare_args={keys.SCENE: {}}))
+    drive_scheduler(scheduler, steps=50)
+
+    assert drawn == [{}]
+    assert moved == []
+
+
+@pytest.mark.timeout(3.0)
+@pytest.mark.parametrize('simulated', [False, True], ids=['real', 'sim'])
+def test_every_rig_is_put_back_where_the_trial_placed_it(world, simulated):
+    """A powered arm holds the policy's last setpoint through the gap to the next trial, so what the trial
+    placed is placed again once the recording stops — the same joints it opened on, never a fresh draw. A
+    sim rig is asked no differently."""
+    placed = []
+    arm = _Scene(placed.append)
+    handlers = {keys.ARM: arm.env_reset}
+    harness = Harness(StubPolicy(), make_embodiment(simulated=simulated, prepare_handlers=handlers))
+    p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.ARM], arm.env_reset)
+
+    start = JointPosition(np.arange(7, dtype=np.float64))
+    scheduler = world.start([harness, arm, _Pacer()])
+    answer = p['perform_task'](Task(instruction_source='stack', timeout_sec=0.05, prepare_args={keys.ARM: start}))
+    drive_scheduler(scheduler, steps=2000)
+
+    assert answer.done(), 'the episode never ended, so there was no close to be put back by'
+    assert len(placed) == 2, 'the trial opened on its start pose and closes back at it'
+    # The same object every time: a trial closes on the joints it opened on, never a fresh draw.
+    assert all(asked is start for asked in placed)
+
+
+class _PlacesOnce(pimm.ControlSystem):
+    """A device that answers the first ask and keeps every one after it in hand."""
+
+    def __init__(self):
+        self.env_reset = pimm.calls.ControlSystemHandler[Any, None](self)
+        self.asks = 0
+
+    def run(self, should_stop, clock):
+        while not should_stop.value:
+            for call in self.env_reset.incoming():
+                self.asks += 1
+                if self.asks == 1:
+                    call.set_result(None)
+            yield pimm.Sleep(0.001)
+
+
+@pytest.mark.timeout(3.0)
+def test_a_trial_does_not_end_until_the_rig_is_back_where_it_started(world):
+    """The terminal waits on the return move. Handed back sooner, the next trial's scene draw goes ahead of a
+    move still travelling and rebuilds the model under it, leaving nothing but its timeout to end it."""
+    arm = _PlacesOnce()
+    harness = Harness(StubPolicy(), make_embodiment(prepare_handlers={keys.ARM: arm.env_reset}))
+    p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.ARM], arm.env_reset)
+
+    scheduler = world.start([harness, arm, _Pacer()])
+    task = Task(instruction_source='stack', timeout_sec=0.05, prepare_args={keys.ARM: JointPosition(np.zeros(7))})
+    answer = p['perform_task'](task)
+    drive_scheduler(scheduler, steps=2000)
+
+    assert arm.asks == 2, 'the rig was never asked to go back'
+    assert not answer.done(), 'the terminal landed while the return move was still in hand'
+
+
+@pytest.mark.timeout(3.0)
 def test_a_trial_asking_to_ready_what_the_rig_has_not_got_fails_loudly(world):
-    """The args are read per handler, so a name matching none of them would be dropped and the device would
-    silently get its own default instead of what the trial asked for."""
+    """Only the handlers a task names are asked, so a name matching none of them would go unasked and the
+    trial would open on a rig nothing readied."""
     scene = _Scene(lambda _params: None)
     harness = Harness(StubPolicy(), make_embodiment(prepare_handlers={keys.SCENE: scene.env_reset}))
     p = _pair_all(world, harness)
     wire_call(world, harness.prepare[keys.SCENE], scene.env_reset)
 
     scheduler = world.start([harness, scene])
-    answer = p['perform_task'](Task(instruction_source='stack', timeout_sec=0.05, prepare_args={keys.ARM: None}))
+    answer = p['perform_task'](
+        Task(instruction_source='stack', timeout_sec=0.05, prepare_args={keys.ARM: JointPosition(np.zeros(7))})
+    )
 
     with pytest.raises(AssertionError, match='not something this embodiment readies'):
         drive_scheduler(scheduler, steps=50)
@@ -1026,7 +1086,7 @@ class _FrameWatchingPolicy(Policy):
         self._wall_sec = wall_sec
         self.seen: list[tuple[np.ndarray, np.ndarray]] = []
 
-    def new_session(self, context=None, now=None):
+    def new_session(self, context=None, now=None, rt=None):
         return _FrameWatchingPolicy._Session(self)
 
     class _Session(Session):
@@ -1078,7 +1138,7 @@ class _AbandonedCallPolicy(Policy):
         self._wall_sec = wall_sec
         self.events: list[str] = []
 
-    def new_session(self, context=None, now=None):
+    def new_session(self, context=None, now=None, rt=None):
         self.events.append('open')
         return _AbandonedCallPolicy._Session(self)
 
@@ -1152,7 +1212,7 @@ def test_task_instruction_reaches_session_context_after_reset(world):
     wire_call(world, harness.prepare[keys.SCENE], drawing.env_reset)
 
     scheduler = world.start([harness, drawing])
-    p['perform_task'](Task(instruction_source=lambda: scene['task'], timeout_sec=0.05))
+    p['perform_task'](Task(instruction_source=lambda: scene['task'], timeout_sec=0.05, prepare_args={keys.SCENE: {}}))
     drive_scheduler(scheduler, steps=200)
 
     assert policy.last_reset_context is not None
@@ -1173,7 +1233,7 @@ class _LabeledRecorder(pimm.SignalEmitter):
 @pytest.mark.timeout(3.0)
 def test_finish_stops_playing_the_live_chunk(world):
     """Finishing drops the schedule the harness is playing: the chunk's remaining waypoints never reach the
-    devices, and the only command after the recorder's STOP is the home the close emits."""
+    devices, so nothing is emitted past the recorder's STOP."""
     policy = ChunkPolicy()
     wrapped = ActionTimestamp(fps=5.0).wrap(policy)  # 1.8 s chunk — won't drain before the episode ends
     harness = Harness(wrapped, make_embodiment())
@@ -1215,7 +1275,7 @@ def test_empty_trajectory_leaves_every_channel_holding(world):
             return []
 
     class EmptyChunkPolicy(Policy):
-        def new_session(self, context=None, now=None):
+        def new_session(self, context=None, now=None, rt=None):
             return _EmptyChunkSession()
 
     harness = Harness(EmptyChunkPolicy(), make_embodiment())
@@ -1478,10 +1538,12 @@ def test_timing_spans_recorded_with_taxonomy(world, tmp_path):
     harness = Harness(policy, make_embodiment())
     p = _pair_all(world, harness)
     robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
-    # A latched observation set makes every step's inference fire (the harness reads the latest value).
-    producer = ManualDriver([
-        (partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state), 0.0)
-    ])
+    # A latched observation set makes the inference of every step run, because the harness reads the latest
+    # value. The world ends when the script runs out, so the script covers the rounds one inference takes:
+    # one round starts the round trip, and a later round reads its answer.
+    producer = ManualDriver(
+        [(partial(emit_ready_payload, p['frame_em'], p['robot_em'], p['grip_em'], robot_state), 0.0)] * 4
+    )
 
     with telemetry.bind(tmp_path, telemetry_keys.HARNESS_PROCESS, 'run-taxonomy'), _eval_pass('run-taxonomy'):
         scheduler = world.start([harness, producer])
@@ -1506,7 +1568,9 @@ def test_timing_spans_recorded_with_taxonomy(world, tmp_path):
     assert all(r.parent_id == episode.span_id for r in by_name[telemetry_keys.SPAN_POLICY_INFER])
 
     assert episode.attrs[telemetry_keys.ATTR_EPISODE_INDEX] == 0
-    assert episode.attrs[telemetry_keys.ATTR_EPISODE_STEPS] == len(by_name[telemetry_keys.SPAN_POLICY_INFER])
+    # Every answered round trip is one step. The trial can end on a round trip in flight, which has no step.
+    infers = len(by_name[telemetry_keys.SPAN_POLICY_INFER])
+    assert infers - 1 <= episode.attrs[telemetry_keys.ATTR_EPISODE_STEPS] <= infers
     assert episode.attrs[telemetry_keys.ATTR_EPISODE_VIRTUAL_S] >= 0.0
 
 
@@ -1554,7 +1618,10 @@ def test_failed_pass_seals_open_episode_span(world, tmp_path):
     harness = Harness(policy, make_embodiment(prepare_handlers={keys.SCENE: scene}))
     wire_call(world, harness.prepare[keys.SCENE], scene)
     harness.ds_command._bind(RecordingEmitter())
-    _ask(world, harness, Task(instruction_source='stack', timeout_sec=10.0, meta={keys.EVAL_TRIAL_INDEX: 0}))
+    task = Task(
+        instruction_source='stack', timeout_sec=10.0, prepare_args={keys.SCENE: {}}, meta={keys.EVAL_TRIAL_INDEX: 0}
+    )
+    _ask(world, harness, task)
     stop = SimpleNamespace(value=False)
     clock = _ManualClock()
 
@@ -1585,67 +1652,38 @@ def test_failed_pass_seals_open_episode_span(world, tmp_path):
 
 
 @pytest.mark.timeout(3.0)
-def test_episode_virtual_duration_starts_at_the_first_observation(world, tmp_path):
-    """A simulated producer's reset only arms frame zero, which it publishes on a later turn; the rounds in
-    between advance the virtual clock without stepping the environment. The rollout's virtual duration
-    measures from the first cycle that has an observation, so that gap stays reset work instead of inflating
-    the real-time factor the report derives from it."""
-    harness = Harness(ChunkPolicy(), make_embodiment())
+def test_episode_virtual_duration_starts_when_the_rig_is_ready(world, tmp_path):
+    """The rounds a rig spends readying itself advance the virtual clock without stepping the environment.
+    The rollout's virtual duration measures from the end of the prepare, so that stretch stays reset work
+    instead of inflating the real-time factor the report derives from it."""
+    scene = _Scene(lambda _: None, draw_s=0.2)
+    harness = Harness(ChunkPolicy(), make_embodiment(prepare_handlers={keys.SCENE: scene.env_reset}))
     p = _pair_all(world, harness)
+    wire_call(world, harness.prepare[keys.SCENE], scene.env_reset)
     robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
 
     with telemetry.bind(tmp_path, telemetry_keys.HARNESS_PROCESS, 'run-anchor'), _eval_pass('run-anchor'):
-        scheduler = world.start([harness])
-        p['perform_task'](Task(instruction_source='test', timeout_sec=None))
-        drive_scheduler(scheduler, steps=1)
-        gap_start = world.clock.now()
-        drive_scheduler(scheduler, steps=40)  # no observation yet: the producer has not published frame zero
-        gap_s = world.clock.now() - gap_start
+        scheduler = world.start([harness, scene])
+        p['perform_task'](Task(instruction_source='test', timeout_sec=None, prepare_args={keys.SCENE: {}}))
+        draw_start = world.clock.now()
+        for _ in range(1000):
+            drive_scheduler(scheduler, steps=1)
+            if DsWriterCommandType.START_EPISODE in _ds_types(p):
+                break
+        draw_s = world.clock.now() - draw_start
         emit_ready_payload(p['frame_em'], p['robot_em'], p['grip_em'], robot_state)
-        drive_scheduler(scheduler, steps=5)
+        drive_scheduler(scheduler, steps=10)  # two control systems per round, so a round is two steps
         p['done_em'].emit(OPERATOR_DONE)
-        drive_scheduler(scheduler, steps=3)
+        drive_scheduler(scheduler, steps=20)
 
     spans = list(telemetry.read_spans(telemetry.spans_path(tmp_path, telemetry_keys.HARNESS_PROCESS)))
     episodes = [s for s in spans if s.name == telemetry_keys.SPAN_EPISODE]
     assert len(episodes) == 1
     virtual_s = episodes[0].attrs[telemetry_keys.ATTR_EPISODE_VIRTUAL_S]
-    assert virtual_s > 0.0  # the observed cycles are measured
-    # Five observed rounds against forty unobserved ones: anchoring when the reset returned would swallow the
-    # whole gap into the rollout's virtual duration.
-    assert virtual_s < gap_s
-
-
-@pytest.mark.timeout(3.0)
-def test_a_later_episode_waits_for_its_own_first_observation(world, tmp_path):
-    """An observation channel latches its last value, so after the first episode every channel already holds
-    one. A rollout still anchors on a value delivered after its own reset — anchoring on the latched frame
-    would charge the wait for frame zero to the rollout and infer on the previous episode's last scene."""
-    harness = Harness(ChunkPolicy(), make_embodiment())
-    p = _pair_all(world, harness)
-    robot_state = make_robot_state([0.1, 0.2, 0.3], [0.4, 0.5, 0.6])
-
-    def episode(gap_steps: int) -> float:
-        p['perform_task'](Task(instruction_source='test', timeout_sec=None))
-        drive_scheduler(scheduler, steps=1)
-        gap_start = world.clock.now()
-        drive_scheduler(scheduler, steps=gap_steps)  # the producer has not published this episode's frame zero
-        gap_s = world.clock.now() - gap_start
-        emit_ready_payload(p['frame_em'], p['robot_em'], p['grip_em'], robot_state)
-        drive_scheduler(scheduler, steps=5)
-        p['done_em'].emit(OPERATOR_DONE)
-        drive_scheduler(scheduler, steps=3)
-        return gap_s
-
-    with telemetry.bind(tmp_path, telemetry_keys.HARNESS_PROCESS, 'run-anchor-2'), _eval_pass('run-anchor-2'):
-        scheduler = world.start([harness])
-        episode(gap_steps=2)
-        gap_s = episode(gap_steps=40)
-
-    spans = list(telemetry.read_spans(telemetry.spans_path(tmp_path, telemetry_keys.HARNESS_PROCESS)))
-    episodes = [s for s in spans if s.name == telemetry_keys.SPAN_EPISODE]
-    assert len(episodes) == 2
-    assert episodes[1].attrs[telemetry_keys.ATTR_EPISODE_VIRTUAL_S] < gap_s
+    assert virtual_s > 0.0  # the rounds the policy ran for are measured
+    # A handful of rollout rounds against the 0.2 the draw took: anchoring at the ask would swallow the draw
+    # into the rollout's virtual duration.
+    assert virtual_s < draw_s
 
 
 def test_unanchored_chunk_is_refused():
@@ -1709,7 +1747,7 @@ class SlowPolicy(Policy):
         self._span_sec = span_sec
         self._steps = steps
 
-    def new_session(self, context=None, now=None):
+    def new_session(self, context=None, now=None, rt=None):
         return _SlowSession(self._wall_sec, self._span_sec, self._steps)
 
 
@@ -1783,36 +1821,46 @@ def _run_episode(
     ])
     systems = [harness, driver, _Pacer()] if simulated else [harness, driver]
     drive_scheduler(world.start(systems), steps=steps)
-    return grip_recorder.emitted[1:]  # drop the startup home
+    return grip_recorder.emitted
+
+
+def _slow_policies(wall_sec: float) -> list:
+    """A model that takes ``wall_sec`` in each home it can run in: inside the session call, and inside a
+    function the session starts and returns from at once. The trial pays the same for both."""
+    return [
+        pytest.param(SlowPolicy(wall_sec=wall_sec), id='in-the-call'),
+        pytest.param(RemoteStubPolicy(wall_sec=wall_sec), id='in-a-function'),
+    ]
 
 
 @pytest.mark.timeout(20.0)
-def test_an_uncharged_call_pauses_the_world(world):
+@pytest.mark.parametrize('policy', _slow_policies(0.05))
+def test_an_uncharged_call_pauses_the_world(world, policy):
     """Sim's default charges nothing: the world does not advance while the model runs, so the chunk is
     anchored at the observation's own instant however long the call really took."""
-    played = _run_episode(world, SlowPolicy(wall_sec=0.05), ChunkedSchedule(), charge_inference_time=False)
+    played = _run_episode(world, policy, ChunkedSchedule(), charge_inference_time=False)
 
     assert played, 'no command was played'
     assert played[0][0] < 0.05, f'the world paid for the call: first command at {played[0][0]}s'
 
 
 @pytest.mark.timeout(20.0)
-def test_a_charged_call_costs_its_own_wall_duration(world):
+@pytest.mark.parametrize('policy', _slow_policies(0.2))
+def test_a_charged_call_costs_its_own_wall_duration(world, policy):
     """``charge_inference_time=True`` charges the world what the model really took, so a slow server is scored
     as slow — at the cost of a trace that inherits the machine's noise."""
-    played = _run_episode(world, SlowPolicy(wall_sec=0.2), ChunkedSchedule(), charge_inference_time=True)
+    played = _run_episode(world, policy, ChunkedSchedule(), charge_inference_time=True)
 
     assert played, 'no command was played'
     assert played[0][0] >= 0.2, f'first command at {played[0][0]}s, under the 0.2s the call took'
 
 
 @pytest.mark.timeout(20.0)
-def test_a_real_rig_pays_wall_time_whatever_the_trial_asks_for(world):
+@pytest.mark.parametrize('policy', _slow_policies(0.2))
+def test_a_real_rig_pays_wall_time_whatever_the_trial_asks_for(world, policy):
     """The knob is sim-only: a real rig pays what its calls take, so a task leaving
     ``charge_inference_time`` unset does not hold the world for them."""
-    played = _run_episode(
-        world, SlowPolicy(wall_sec=0.2), ChunkedSchedule(), charge_inference_time=False, simulated=False
-    )
+    played = _run_episode(world, policy, ChunkedSchedule(), charge_inference_time=False, simulated=False)
 
     assert played, 'no command was played'
     assert played[0][0] >= 0.2, f'first command at {played[0][0]}s, under the 0.2s the call took'
@@ -1969,7 +2017,7 @@ def test_a_stop_clears_the_chunk_in_the_round_the_fault_is_seen(world):
     ])
     drive_scheduler(world.start([harness, driver, _Pacer(period)]), steps=4000)
 
-    played = [t for t, _ in grip_recorder.emitted[1:]]  # drop the startup home
+    played = [t for t, _ in grip_recorder.emitted]
     assert [t for t in played if t < fault_at], 'the chunk was not playing when the arm faulted'
     late = [t for t in played if t > fault_at + 3 * period]
     assert not late, f'the faulted arm was still being driven at {late}'
@@ -1977,8 +2025,8 @@ def test_a_stop_clears_the_chunk_in_the_round_the_fault_is_seen(world):
 
 @pytest.mark.timeout(20.0)
 def test_finish_does_not_wait_for_the_call_in_flight():
-    """Finishing ends the episode where it lands: the recording stops and the arm homes while the model is
-    still inside its call, and the failure that call ends in reaches nobody.
+    """Finishing ends the episode where it lands: the recording stops while the model is still inside its
+    call, and the failure that call ends in reaches nobody.
 
     Real time, real rig: a wall-charged call is the only one the harness leaves in flight across rounds.
     """
@@ -1990,7 +2038,7 @@ def test_finish_does_not_wait_for_the_call_in_flight():
             raise RuntimeError('inference boom')
 
     class _HangingPolicy(Policy):
-        def new_session(self, context=None, now=None):
+        def new_session(self, context=None, now=None, rt=None):
             return _HangingSession()
 
     with pimm.World() as world:
@@ -2036,7 +2084,7 @@ def test_the_run_ends_only_once_the_call_it_abandoned_is_out_of_the_policy():
             return None
 
     class _HangingPolicy(Policy):
-        def new_session(self, context=None, now=None):
+        def new_session(self, context=None, now=None, rt=None):
             return _HangingSession()
 
     with pimm.World() as world:
@@ -2085,7 +2133,7 @@ def test_the_session_is_closed_only_once_its_call_has_left_it():
             inside_at_close.append(self.inside)
 
     class _HangingPolicy(Policy):
-        def new_session(self, context=None, now=None):
+        def new_session(self, context=None, now=None, rt=None):
             return _HangingSession()
 
     with pimm.World() as world:
@@ -2135,7 +2183,7 @@ def test_a_rescheduled_trajectory_clears_the_channels_it_omits(world):
             return [{keys.ROBOT_COMMAND: command, keys.ACTION_TIMESTAMP: i * 0.01} for i in range(10)]
 
     class _GripThenArmPolicy(Policy):
-        def new_session(self, context=None, now=None):
+        def new_session(self, context=None, now=None, rt=None):
             return _GripThenArm()
 
     harness = Harness(ChunkedSchedule().wrap(_GripThenArmPolicy()), make_embodiment())
@@ -2207,4 +2255,4 @@ def test_finishing_discards_a_call_that_is_still_in_flight(world):
     ])
     drive_scheduler(world.start([harness, driver, _Pacer()]), steps=2000)
 
-    assert all(isinstance(c, Reset) for c in _emitted_commands(cmd_recorder))
+    assert not _emitted_commands(cmd_recorder)
